@@ -68,6 +68,7 @@ from sglang.srt.utils import ceil_align, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.mem_cache.storage.flexkv import FlexKVDraft
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
@@ -374,6 +375,7 @@ def build_kv_cache(
     enable_kv_cache_events: bool,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
+    flexkv_draft: FlexKVDraft | None = None,
     dynamo_kv_event_format: bool = False,
     kv_event_lora_names: Optional[KvEventLoraNames] = None,
     draft_window_reaches: Optional[dict[str, int]] = None,
@@ -500,6 +502,7 @@ def build_kv_cache(
     tree_context = TreeCacheBuildContext(
         server_args=server_args,
         params=params,
+        flexkv_draft=flexkv_draft,
         is_hybrid_swa=is_hybrid_swa,
         full_tokens_per_layer=full_tokens_per_layer,
         is_hybrid_ssm=is_hybrid_ssm,

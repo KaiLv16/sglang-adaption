@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory, prepare_flexkv_draft
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.flexkv_test_utils import RequestState as SimpleNamespace
@@ -252,6 +252,49 @@ def test_shutdown_releases_flexkv_and_inner_host_resources(
     assert order == (["flexkv", "inner"] if hybrid else ["flexkv"])
 
 
+@pytest.mark.parametrize(
+    ("algorithm", "multi_layer", "steps", "error"),
+    [
+        ("eagle", False, 3, None),
+        ("standalone", False, 3, None),
+        ("dflash", False, 3, None),
+        ("eagle", True, 1, None),
+        ("eagle", True, 2, "longer prefix key"),
+    ],
+)
+def test_prepare_flexkv_draft_key(monkeypatch, algorithm, multi_layer, steps, error):
+    monkeypatch.setenv("FLEXKV_CACHE_DRAFT_KV", "1")
+    worker = MagicMock(use_compact_draft_cache=False, speculative_num_steps=steps)
+    spec = worker.target_worker.model_runner.spec_algorithm
+    spec.is_eagle.return_value = algorithm == "eagle"
+    spec.is_standalone.return_value = algorithm == "standalone"
+    allocator = object()
+    runners = tuple(MagicMock(token_to_kv_pool_allocator=allocator) for _ in range(2))
+    for runner in runners:
+        runner.runner_ids.is_fused_draft = False
+    worker._draft_model_runners.return_value = runners
+    with patch(
+        "sglang.srt.mem_cache.storage.flexkv.get_spec",
+        return_value=SimpleNamespace(
+            enable_multi_layer_eagle=multi_layer, speculative_dflash_draft_kv_ring=False
+        ),
+    ):
+        if error:
+            with pytest.raises(ValueError, match=error):
+                prepare_flexkv_draft(worker, allocator)
+        else:
+            draft = prepare_flexkv_draft(worker, allocator)
+            assert draft.pools == tuple(r.token_to_kv_pool for r in runners)
+            assert draft.needs_bigram_key == (algorithm != "dflash")
+
+
+def test_prepare_flexkv_draft_opt_in(monkeypatch):
+    monkeypatch.delenv("FLEXKV_CACHE_DRAFT_KV", raising=False)
+    assert prepare_flexkv_draft(None, object()) is None
+    with pytest.raises(ValueError, match="FLEXKV_CACHE_DRAFT_KV=1"):
+        prepare_flexkv_draft(MagicMock(), object())
+
+
 @pytest.mark.parametrize("enable_dp_attention", [False, True])
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_factory_uses_published_parallel_context(enable_dp_attention, hybrid):
@@ -260,6 +303,7 @@ def test_factory_uses_published_parallel_context(enable_dp_attention, hybrid):
     """
     context = SimpleNamespace(
         params=SimpleNamespace(is_eagle=False),
+        flexkv_draft=None,
         model_config=object(),
         tp_rank=6,
         tp_size=8,

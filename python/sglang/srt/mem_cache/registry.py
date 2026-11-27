@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.mem_cache.storage.flexkv import FlexKVDraft
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
@@ -49,6 +50,7 @@ class TreeCacheBuildContext:
     tp_group: Any
     full_tokens_per_layer: Optional[int] = None
     is_dsa: bool = False
+    flexkv_draft: FlexKVDraft | None = None
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]

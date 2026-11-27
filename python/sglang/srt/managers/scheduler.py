@@ -637,10 +637,18 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_kv_event_lora_names()
+        flexkv_draft = None
+        if self.enable_flexkv:
+            from sglang.srt.mem_cache.storage.flexkv import prepare_flexkv_draft
+
+            flexkv_draft = prepare_flexkv_draft(
+                self.draft_worker, self.tp_worker.model_runner.token_to_kv_pool_allocator
+            )
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,
             tp_worker=self.tp_worker,
+            flexkv_draft=flexkv_draft,
             page_size=self.page_size,
             spec_algorithm=self.spec_algorithm,
             enable_metrics=get_observability().enable_metrics,
