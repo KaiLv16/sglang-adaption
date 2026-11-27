@@ -711,15 +711,18 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                 )
             return
 
+        rid = _request_key(req.cache_request_handle)
         try:
             fkv_task_id = self._launch_store(
-                _request_key(req.cache_request_handle),
+                rid,
                 list(token_ids),
                 kv_indices,
+                node=new_last_node,
                 **namespace_kwargs,
             )
         except Exception:  # noqa: BLE001
-            self.dec_lock_ref(new_last_node)
+            if rid not in self._inflight_store_nodes:
+                self.dec_lock_ref(new_last_node)
             raise
 
         if fkv_task_id < 0:
@@ -729,9 +732,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             return
 
         with self._node_lock:
-            self._inflight_store_nodes[_request_key(req.cache_request_handle)] = (
-                new_last_node
-            )
+            self._inflight_store_nodes[rid] = new_last_node
 
     def _launch_store(
         self,
@@ -739,6 +740,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         token_ids: list[int],
         kv_indices: torch.Tensor,
         *,
+        node: TreeNode,
         namespace: Optional[list[str]] = None,
         mapping_already_on_cpu: bool = False,
         skip_mapping_validation: bool = False,
@@ -768,13 +770,21 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                         f"unique_pages={unique_pages.numel()}, aligned={aligned}"
                     )
             with self._store_profile_scope("flexkv.store.connector_store_kv"):
-                return self.flexkv_connector.store_kv(
-                    rid=rid,
-                    token_ids=token_ids,
-                    kv_indices=kv_indices,
-                    sglang_req_id=json.loads(rid)[0],
-                    **({"namespace": namespace} if namespace is not None else {}),
-                )
+                try:
+                    return self.flexkv_connector.store_kv(
+                        rid=rid,
+                        token_ids=token_ids,
+                        kv_indices=kv_indices,
+                        sglang_req_id=json.loads(rid)[0],
+                        **({"namespace": namespace} if namespace is not None else {}),
+                    )
+                except Exception as exc:
+                    if getattr(exc, "store_submission_uncertain", False) is True:
+                        # The reader may be active even if submission raised.
+                        # Keep the source locked until completion or reset drains it.
+                        with self._node_lock:
+                            self._inflight_store_nodes[rid] = node
+                    raise
 
     def _store_profile_scope(self, name: str):
         if not getattr(self, "_profile_store_stages", False):
@@ -833,6 +843,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                         rid,
                         pending.token_ids,
                         store_indices,
+                        node=pending.node,
                         mapping_already_on_cpu=pending.cpu_indices is not None,
                         skip_mapping_validation=pending.cpu_indices is None,
                         **(
@@ -842,7 +853,8 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                         ),
                     )
             except Exception:  # noqa: BLE001
-                self.dec_lock_ref(pending.node)
+                if rid not in self._inflight_store_nodes:
+                    self.dec_lock_ref(pending.node)
                 raise
             if fkv_task_id < 0:
                 self.dec_lock_ref(pending.node)

@@ -168,6 +168,39 @@ def test_abort_retains_store_source_until_transfer_completion(stage):
         assert rid not in cache._inflight_store_nodes
 
 
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_store_error_keeps_source_locked_only_if_submission_is_uncertain(uncertain):
+    cache, _ = _make_cache()
+    rid = _tracking_key("stored")
+    node = object()
+    slots = torch.arange(8, 12)
+    ready = MagicMock()
+    ready.query.return_value = True
+    cache._pending_store_copies[rid] = SimpleNamespace(
+        node=node, token_ids=list(range(4)), cpu_indices=slots,
+        kv_indices=slots, ready_event=ready, namespace=None,
+    )
+    cache.dec_lock_ref = MagicMock()
+    if uncertain:
+        error = RuntimeError("submit reply lost")
+        error.store_submission_uncertain = True
+    else:
+        error = ValueError("invalid store input")
+    cache.flexkv_connector.store_kv.side_effect = error
+
+    with patch("torch.cuda.stream", return_value=contextlib.nullcontext()):
+        with pytest.raises(type(error), match=str(error)):
+            cache._launch_ready_store_copies()
+
+    if uncertain:
+        cache.dec_lock_ref.assert_not_called()
+        assert cache._inflight_store_nodes[rid] is node
+        cache.flexkv_connector.check_completed_stores.return_value = [rid]
+        cache._drain_completed_stores()
+    cache.dec_lock_ref.assert_called_once_with(node)
+    assert rid not in cache._inflight_store_nodes
+
+
 def _make_cache(page_size=4):
     allocator = MagicMock()
     allocator.page_size = 4
