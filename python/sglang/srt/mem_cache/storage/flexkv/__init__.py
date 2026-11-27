@@ -13,12 +13,75 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
-from sglang.srt.runtime_context import get_context, get_memory, get_serving
+from sglang.srt.runtime_context import get_context, get_memory, get_serving, get_spec
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+    from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FlexKVDraft:
+    pools: tuple[object, ...]
+    needs_bigram_key: bool
+
+
+def prepare_flexkv_draft(
+    worker: BaseSpecWorker | None, allocator: BaseTokenToKVPoolAllocator
+) -> FlexKVDraft | None:
+    """Describe independent draft buffers while their owning worker is available."""
+    if os.environ.get("FLEXKV_CACHE_DRAFT_KV", "0") != "1":
+        if getattr(worker, "primary_draft_kv_pool", None) is not None:
+            raise ValueError(
+                "FlexKV host hits with independent draft KV require FLEXKV_CACHE_DRAFT_KV=1"
+            )
+        return None
+
+    if worker is None:
+        raise ValueError("Draft KV caching requires a speculative worker")
+    spec = get_spec()
+    if (
+        getattr(worker, "use_compact_draft_cache", False)
+        or spec.speculative_dflash_draft_kv_ring
+    ):
+        raise ValueError("A private draft KV ring does not use target slot IDs")
+
+    runners = worker._draft_model_runners()
+    if not runners:
+        raise ValueError(
+            "The speculative worker has no independent draft KV buffers to cache"
+        )
+    for runner in runners:
+        if (
+            runner.runner_ids.is_fused_draft
+            or runner.token_to_kv_pool_allocator is not allocator
+        ):
+            raise ValueError(
+                "FlexKV requires independent draft buffers sharing the target allocator"
+            )
+
+    algorithm = worker.target_worker.model_runner.spec_algorithm
+    # EAGLE and STANDALONE rotate draft inputs by one token. Each additional
+    # multi-layer EAGLE step rotates again, beyond the bigram key's boundary.
+    if (
+        algorithm.is_eagle()
+        and spec.enable_multi_layer_eagle
+        and worker.speculative_num_steps != 1
+    ):
+        raise ValueError(
+            "Cascaded draft input rotations need a longer prefix key than bigram"
+        )
+    return FlexKVDraft(
+        pools=tuple(runner.token_to_kv_pool for runner in runners),
+        needs_bigram_key=algorithm.is_eagle() or algorithm.is_standalone(),
+    )
 
 
 def _flexkv_factory(ctx):
@@ -37,13 +100,17 @@ def _flexkv_factory(ctx):
         raise ValueError("FlexKV cannot be combined with --enable-hierarchical-cache")
     if ctx.is_hybrid_ssm:
         raise NotImplementedError("FlexKV does not support Mamba/SSM pools yet")
-    if ctx.params.is_eagle:
-        # N bigram KV slots depend on N+1 raw tokens. The connector's token-only
-        # key uses N tokens and would drop the distinguishing boundary token.
+    params = ctx.params
+    draft = getattr(ctx, "flexkv_draft", None)
+    if draft is not None:
+        if ctx.is_hybrid_swa:
+            raise ValueError("Draft KV caching requires a full-attention pool")
+        if draft.needs_bigram_key and not params.is_eagle:
+            params = replace(params, is_eagle=True)
+    elif params.is_eagle or os.environ.get("FLEXKV_CACHE_DRAFT_KV", "0") == "1":
         raise ValueError(
-            "FlexKV does not support EAGLE-style bigram cache keys yet: "
-            "the connector cannot preserve the extra boundary token. "
-            "Disable FlexKV or use a speculative mode without bigram cache keys."
+            "FlexKV speculative host hits require FLEXKV_CACHE_DRAFT_KV=1 "
+            "and registered draft KV pools"
         )
 
     if ctx.disable_radix_cache:
@@ -109,7 +176,7 @@ def _flexkv_factory(ctx):
         dp_rank = getattr(parallel_state, "dp_rank", 0) or 0
 
     common_kwargs = dict(
-        params=ctx.params,
+        params=params,
         model_config=ctx.model_config,
         server_args=server_args,
         tp_rank=ctx.tp_rank,
@@ -136,6 +203,7 @@ def _flexkv_factory(ctx):
 
     return FlexKVRadixCache(
         tp_size=ctx.tp_size,
+        draft_pools=draft.pools if draft is not None else (),
         **common_kwargs,
     )
 

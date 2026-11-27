@@ -243,6 +243,38 @@ def _make_cache(page_size=4):
     return cache, allocator
 
 
+def test_draft_bigram_lookup_prefetch_and_store_share_page_boundary():
+    cache, _ = _make_cache(page_size=4)
+    cache.is_eagle = True
+    connector = _forwarding_connector()
+    connector._chunked_prefetch = True
+    cache.flexkv_connector = connector
+    raw = array("q", [2, 5, 8, 9, 11, 13])
+    expected = [(a << 32) | b for a, b in zip(raw[:4], raw[1:5])]
+    handle = CacheRequestHandle("draft", 0)
+    req = SimpleNamespace(rid="draft", cache_request_handle=handle,
+                          origin_input_ids=raw, output_ids=array("q"),
+                          kv=SimpleNamespace(kv_committed_len=6, req_pool_idx=0, cache_protected_len=0),
+                          last_node=cache.root_node)
+    result = cache.match_prefix(MatchPrefixParams(key=RadixKey(raw), req=req))
+    assert result.host_hit_length == 4
+    assert connector.kv_manager.get_match.call_args.kwargs["token_ids"] == expected
+    marker = cache._load_markers[_tracking_key("draft")]
+    assert list(marker.key.raw_token_ids()) == list(raw[:5])
+    cache.prefetch_from_storage(handle, token_ids=raw)
+    assert connector.prefetch_async.call_args.args[1] == expected
+
+    cache.req_to_token_pool = SimpleNamespace(req_to_token=torch.arange(100, 106).reshape(1, 6))
+    with (patch("torch.cuda.current_stream", return_value=MagicMock()),
+          patch("torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext())):
+        cache.checkpoint(req, up_to=len(raw))
+    assert connector.kv_manager.put_match.call_args.kwargs["token_ids"] == expected
+    raw[4] += 1
+    assert list(marker.key.raw_token_ids())[-1] == 11
+    cache.match_prefix(MatchPrefixParams(key=RadixKey(raw), req=req))
+    assert connector.kv_manager.get_match.call_args.kwargs["token_ids"][-1] == expected[-1] + 1
+
+
 def _load(cache, key, value_numel, uncached_len, rid):
     load_fn = MagicMock(side_effect=lambda slots: int(slots.numel()))
     result = cache._allocate_and_load(

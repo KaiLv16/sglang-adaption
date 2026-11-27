@@ -26,6 +26,21 @@ def _request_key(handle: CacheRequestHandle) -> str:
     return json.dumps([handle.rid, handle.attempt_id], separators=(",", ":"))
 
 
+def _storage_ids(tokens, bigram):
+    """One int64 per cached slot, including the final boundary token of a bigram."""
+    if not bigram:
+        return tokens
+    import numpy as np
+
+    ids = np.asarray(tokens)
+    if not ids.size:
+        return []
+    if ids.ndim != 1 or ids.dtype.kind not in "iu" or ids.min() < 0 or ids.max() > 0xffffffff:
+        raise ValueError("Bigram cache keys require a chain of uint32 token IDs")
+    words = ids.astype(np.uint64, copy=False)
+    return ((words[:-1] << np.uint64(32)) | words[1:]).view(np.int64).tolist()
+
+
 def _namespace_kwargs(connector, extra_key, cache_salt) -> Optional[dict]:
     """Return scoped connector arguments, or None when reuse is unsupported.
 
@@ -103,14 +118,15 @@ class FlexKVCacheLifecycleMixin:
                         cache_salt=req.cache_salt,
                     )
                     gpu = connector.sync_prefix_length(peek(MatchPrefixParams(key=key)))
-                    aligned = end // self.page_size * self.page_size
+                    bigram = getattr(self, "is_eagle", False)
+                    aligned = max(0, end - int(bigram)) // self.page_size * self.page_size
                     if gpu >= aligned:
                         count = min(gpu, end)
                     else:
                         mask = torch.ones(aligned, dtype=torch.bool)
                         mask[:gpu] = False
                         host = connector.peek_cpu_prefix_tokens(
-                            tokens[:aligned], mask, **namespace
+                            _storage_ids(tokens[:aligned + int(bigram)], bigram), mask, **namespace
                         )
                         if host is not None:
                             count = min(end, gpu + host)
@@ -282,7 +298,7 @@ class FlexKVCacheLifecycleMixin:
         if namespace_kwargs is None or not token_ids:
             return
         prefix = [] if matched_prefix_tokens is None else list(matched_prefix_tokens)
-        ids = prefix + list(token_ids)
+        ids = _storage_ids(prefix + list(token_ids), getattr(self, "is_eagle", False))
         ids = ids[: len(ids) // self.page_size * self.page_size]
         if len(ids) <= len(prefix):
             return

@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
     FlexKVCacheLifecycleMixin,
     _namespace_kwargs,
     _request_key,
+    _storage_ids,
 )
 
 if TYPE_CHECKING:
@@ -122,6 +123,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         pp_group=None,
         attn_tp_group=None,
         attn_cp_group=None,
+        draft_pools=(),
     ) -> None:
         super().__init__(params)
 
@@ -143,6 +145,10 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             pp_group=pp_group,
             attn_tp_group=attn_tp_group_eff,
             attn_cp_group=attn_cp_group,
+            **(
+                {"draft_kvcache": draft_pools, "draft_key_format": "bigram" if self.is_eagle else "token"}
+                if draft_pools else {}
+            ),
         )
 
         self._mode = (
@@ -253,6 +259,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             return super().match_prefix(params)
 
         # FlexKV operates at page granularity
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
         key = key.page_aligned(self.page_size)
 
         base_res = super().match_prefix(params)
@@ -283,10 +290,10 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         )
         if namespace_kwargs is None:
             return base_res
-        token_ids = key.raw_token_ids()
         device_len = int(device_value.numel())
-        if device_len >= len(token_ids):
+        if device_len >= len(key):
             return base_res
+        token_ids = _storage_ids(key.raw_token_ids(), key.is_bigram)
 
         # token_mask=True for tokens NOT on device — FlexKV decides
         # which of those it can serve.
@@ -304,17 +311,8 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             return base_res
 
         # Snapshot the matched key (the live key aliases ``req.fill_ids``).
-        if token_ids is key.token_ids:
-            token_ids_snap = token_ids[:]
-        else:
-            token_ids_snap = token_ids
         self._load_markers[_request_key(req.cache_request_handle)] = _LoadBackMarker(
-            key=RadixKey(
-                token_ids_snap,
-                key.extra_key,
-                key.is_bigram,
-                cache_salt=key.cache_salt,
-            ),
+            key=key[:],
             value_numel=device_len,
         )
         return MatchResult(
@@ -501,7 +499,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
 
         if refreshed_len > value_numel:
             self.flexkv_connector.release_pending(tracking_rid)
-            token_ids = target_key.raw_token_ids()
+            token_ids = _storage_ids(target_key.raw_token_ids(), target_key.is_bigram)
             token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
             token_mask[refreshed_len:] = True
             _, uncached_len = self.flexkv_connector.lookup_kv(
@@ -677,6 +675,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         if new_last_node is None:
             return
         kv_indices = self.path_device_indices(match_result.last_device_node)
+        token_ids = _storage_ids(token_ids, self.is_eagle)
         if kv_indices.numel() != len(token_ids):
             logger.warning(
                 "[FlexKV] store prefix length aligned from %d to %d tokens for rid=%s",
