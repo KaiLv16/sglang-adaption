@@ -749,7 +749,8 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         # copy above is asynchronous on GPU).  The FlexKV D2H path consumes it
         # from ``store_stream``; without this edge the new stream can observe
         # zero-initialized slots and collapse every source page to block 0.
-        if not mapping_already_on_cpu and not skip_mapping_validation:
+        split = getattr(self.flexkv_connector, "_cache_layer_split", False)
+        if not mapping_already_on_cpu and (split or not skip_mapping_validation):
             producer_stream = torch.cuda.current_stream()
             with self._store_profile_scope("flexkv.store.wait_producer_stream"):
                 self.store_stream.wait_stream(producer_stream)

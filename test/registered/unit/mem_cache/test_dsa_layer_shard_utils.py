@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -33,6 +34,7 @@ class TestDSALayerShardUtils(CustomTestCase):
         broadcasts = []
         counter = SimpleNamespace(wait_until=lambda _: self.fail("unexpected wait"))
         pool = SimpleNamespace(
+            enable_flexkv=False,
             remote_kv_layer_id=None,
             pending_remote_kv_broadcast=False,
             pending_remote_kv_layer_id=None,
@@ -59,6 +61,44 @@ class TestDSALayerShardUtils(CustomTestCase):
 
         self.assertEqual(len(broadcasts), 1)
         self.assertEqual(pool.remote_kv_layer_id, 0)
+
+    def test_flexkv_sync_prefetch_waits_before_broadcast(self):
+        events = []
+        pool = SimpleNamespace(
+            enable_flexkv=True,
+            start_layer=4,
+            remote_kv_layer_id=None,
+            pending_remote_kv_broadcast=False,
+            layer_broadcast_comm=None,
+            layer_transfer_counter=SimpleNamespace(wait_until=events.append),
+            _local_layer_idx=lambda layer: layer - 4,
+            _is_layer_owned=lambda _: False,
+            remote_kv_buffer=object(),
+            _broadcast_tensor_from_owner=lambda *args, **kwargs: events.append("broadcast"),
+        )
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 7)
+        self.assertEqual(events, [3, "broadcast"])
+
+    def test_broadcast_fallback_uses_the_selected_backend_group(self):
+        group = Mock(ranks=[2, 6])
+        group.get_available_pynccl_comm.return_value = None
+        pool = SimpleNamespace(layer_shard_rank=0, _get_layer_owner_rank=lambda _: 1)
+        tensor = object()
+        with (
+            patch(
+                "sglang.srt.mem_cache.dsa_cache_layer_split.get_parallel",
+                return_value=SimpleNamespace(attn_cp_group=group),
+            ),
+            patch.object(torch.distributed, "broadcast") as broadcast,
+        ):
+            for enabled, src, expected_group in (
+                (False, 1, group.cpu_group),
+                (True, 6, group.device_group),
+            ):
+                with self.subTest(enable_flexkv=enabled):
+                    pool.enable_flexkv = enabled
+                    LayerSplitDSATokenToKVPool._broadcast_tensor_from_owner(pool, tensor, 0)
+                    broadcast.assert_called_with(tensor, src=src, group=expected_group)
 
     def test_finalize_pending_broadcast_promotes_layer_id(self):
         # After an async prefetch, finalizing must promote pending -> remote so a

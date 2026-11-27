@@ -199,6 +199,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         *args,
         layer_shard_rank: int,
         layer_shard_size: int,
+        enable_flexkv: bool = False,
         **kwargs,
     ):
         assert layer_shard_rank is not None and layer_shard_size > 1, (
@@ -207,6 +208,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
+        self.enable_flexkv = enable_flexkv
         self.layer_broadcast_comm = None
         super().__init__(*args, **kwargs)
         # First global layer index owned by this rank (used by PD transfer to
@@ -298,6 +300,11 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             # standard usage in parallel_state.py.
             with comm.change_state(enable=True):
                 comm.broadcast(tensor, src=owner_rank)
+        elif self.enable_flexkv:
+            # Direct restore broadcasts GPU data, with an owner local to the CP group.
+            torch.distributed.broadcast(
+                tensor, src=cp_group.ranks[owner_rank], group=cp_group.device_group
+            )
         else:
             torch.distributed.broadcast(
                 tensor, src=owner_rank, group=cp_group.cpu_group
@@ -454,6 +461,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
         self.pending_remote_kv_layer_id = None
 
+    def invalidate_layer_split_cache(self) -> None:
+        """Direct host restores bypass the setters that invalidate broadcast copies."""
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        self.remote_kv_layer_id = None
+        self.index_key_cache.remote_layer_id = None
+
     def prefetch_kv_buffer(
         self,
         layer_id: int,
@@ -473,11 +486,21 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 return
             self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
 
+        if self.enable_flexkv and layer_transfer_counter is None:
+            layer_transfer_counter = self.layer_transfer_counter
+            layer_transfer_idx = layer_id - self.start_layer
+
         local_idx = self._local_layer_idx(layer_id)
         src_tensor = (
             self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         )
         if self.layer_broadcast_comm is None:
+            if (
+                self.enable_flexkv
+                and layer_transfer_counter is not None
+                and layer_transfer_idx is not None
+            ):
+                layer_transfer_counter.wait_until(layer_transfer_idx)
             self._broadcast_tensor_from_owner(
                 self.remote_kv_buffer,
                 layer_id,
@@ -544,6 +567,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.index_key_cache.invalidate(layer_id)
 
     def _get_broadcastable_index_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.enable_flexkv:
+            # Direct H2D bypasses the indexer's ordinary write path. Wait on
+            # the owner before publishing the restored Index-K to CP peers.
+            return self.index_key_cache.get_buffer(layer_id)
         return self.index_key_cache.get_broadcastable_buffer(layer_id)
 
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------

@@ -2335,6 +2335,11 @@ class KVCacheConfigurator:
             )
 
             PoolCls = LayerSplitDSATokenToKVPool
+            if (
+                get_memory().enable_flexkv
+                or get_memory().radix_cache_backend == "flexkv"
+            ):
+                pool_kwargs["enable_flexkv"] = True
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:

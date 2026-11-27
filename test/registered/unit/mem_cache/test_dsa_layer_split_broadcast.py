@@ -33,7 +33,7 @@ SIZE = PAGE_SIZE * 3  # a few pages
 PORT = 29711
 
 
-def _run(rank: int, world: int, port: int):
+def _run(rank: int, world: int, port: int, enable_flexkv: bool = False):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
@@ -81,6 +81,7 @@ def _run(rank: int, world: int, port: int):
             kv_cache_dim=KV_LORA_RANK + QK_ROPE,
             layer_shard_rank=cp_rank,
             layer_shard_size=cp_size,
+            enable_flexkv=enable_flexkv,
         )
 
         # Owner writes a layer-distinct constant into each owned kv_buffer layer.
@@ -138,6 +139,29 @@ def _run(rank: int, world: int, port: int):
                 ok = False
         assert ok, f"rank {rank} prefetch path returned incorrect contents"
 
+        if enable_flexkv:
+            # Leave both broadcast caches warm, then simulate direct H2D which
+            # bypasses SGLang setters. Each first reader must wait on its own
+            # layer before it can broadcast the owner's restored bytes.
+            layer = LAYER_NUM - 1
+            waited = []
+
+            class RestoreFence:
+                def wait_until(self, local_layer):
+                    assert local_layer == layer
+                    waited.append(local_layer)
+                    if pool._is_layer_owned(layer):
+                        pool.kv_buffer[layer].fill_(41)
+                        pool.index_k_with_scale_buffer[layer].fill_(42)
+
+            pool.register_layer_transfer_counter(RestoreFence())
+            pool.invalidate_layer_split_cache()
+            pool.prefetch_kv_buffer(layer)
+            assert waited == [layer]
+            assert pool._get_broadcastable_kv_buffer(layer).float().mean().item() == 41
+            assert pool._get_broadcastable_index_buffer(layer).float().mean().item() == 42
+            assert waited == [layer, layer]
+
         print(f"[rank {rank}] OK: all {LAYER_NUM} layers read correct owner contents")
         torch.distributed.barrier()
 
@@ -148,6 +172,12 @@ class TestLayerSplitDSABroadcast(CustomTestCase):
         if world < 2:
             self.skipTest("LayerSplitDSATokenToKVPool broadcast test needs >= 2 GPUs")
         mp.spawn(_run, args=(world, PORT), nprocs=world, join=True)
+
+    def test_flexkv_restore_owner_broadcast(self):
+        world = min(4, torch.cuda.device_count())
+        if world < 2:
+            self.skipTest("FlexKV layer-split restore test needs >= 2 GPUs")
+        mp.spawn(_run, args=(world, PORT, True), nprocs=world, join=True)
 
 
 if __name__ == "__main__":
